@@ -1,0 +1,850 @@
+diff --git a/docs/1.0/adr/0053-client-scoped-url-slots.md b/docs/1.0/adr/0053-client-scoped-url-slots.md
+new file mode 100644
+index 0000000..7e98b7c
+--- /dev/null
++++ b/docs/1.0/adr/0053-client-scoped-url-slots.md
+@@ -0,0 +1,67 @@
++# ADR 0053: Client-scoped URL navigation slots
++
++- Status: accepted
++- Date: 2026-10-26
++
++## Context
++
++A terminal application can open an independent browser page using ADR 0052's
++generic URL action. A sequence of navigation requests sometimes needs to
++replace the application's earlier page, including one hidden with native
++window close. Backend plugins cannot safely identify frontend buffers, and
++browser-specific or plugin-specific keybindings do not belong in core.
++
++## Decision
++
++Extend `open_url` content with an optional `slot`, a 1-64 character ASCII
++identifier containing letters, digits, underscores or hyphens. An unkeyed open
++retains existing independent snapshot behavior. A keyed open first closes and
++deletes the previous projection in that same client's slot, then creates a new
++web buffer. Failure to create the replacement leaves the slot empty.
++
++Managed pages replace the source terminal's visible window contents, without
++creating another split. The terminal buffer and client remain alive. Explicit
++slot close restores the terminal in windows still displaying the page before
++deleting it. Hidden pages are deleted without changing repurposed windows.
++Native page/window close still hides the projection; the normal cell focus
++command reveals the retained terminal. Failed host rendering restores the
++previous window contents.
++
++Add `close_url` content `{action: "close_url", text: "", slot: "page"}`.
++Closing an absent, manually deleted, or hidden projection is idempotent.
++Application helpers are `jusi.editor_client.open_url(url, slot="page")` and
++`close_url(slot="page")`; the worker SDK has corresponding result helpers.
++Delivery acknowledgment confirms the frontend action, not page-load completion.
++Callers serialize their own navigation requests by waiting for acknowledgments.
++
++Slot names live only in fetched action content. The frontend scopes replacement
++authority to its notebook session and the already verified source client, never
++to a process-global name or plugin identity. No frontend buffer numbers, window
++IDs, commands or backend pathnames enter the protocol. Existing editor-action
++ownership, retirement fencing, reconnect deduplication and delivery leases
++apply to both operations. Close does not require a visible source window. Open
++captures the verified source terminal identity, then resolves managed placement
++across all tabs when applying the fetched content. If neither terminal nor page
++is visible, reveal the same source terminal in a new window. Windows reused for
++unrelated content are preserved. Worker-returned managed URL actions use the
++same placement and replacement path as application actions. Unkeyed exports
++retain their captured-window validation. Failed page deletion retains the slot
++and keeps close retryable; it cannot silently abandon a live page.
++
++Closing or hiding a page does not close its source client or terminal. Explicit
++source-client close forgets slot replacement authority while leaving the last
++delivered page available, preserving URL exports' independent lifetime. This
++does not introduce a durable backend web surface or browser navigation feedback.
++
++## Verification
++
++Shared valid/invalid fixtures cover slot validation and close content in Python,
++Lua and JSON Schema. Socket integration checks private payloads and acknowledged
++close. Frontend tests cover hidden-page replacement, repeated close, manual
++deletion, invalid requests, source survival, same-window presentation and
++restoration, repurposed-window isolation, and isolation of two clients' slots.
++The external jusi-web integration scenario additionally exercises a real Jusi
++service, kernel, worker, PTY/VisiData application and Neovim with a substitute
++WebBuffer command. It covers bootstrap, ambiguous bookmarks, citations, native
++page close followed by another drilldown, list followups closing the old page,
++separate cells retaining separate pages, and recoverable API failure.
+diff --git a/docs/1.0/architecture/web-presentation.md b/docs/1.0/architecture/web-presentation.md
+index 009fe4b..8f7e5d4 100644
+--- a/docs/1.0/architecture/web-presentation.md
++++ b/docs/1.0/architecture/web-presentation.md
+@@ -66,3 +66,29 @@ URLs must be absolute HTTP(S) and reachable from the editor host. A target-side
+ There is no implicit tunnel or reverse proxy. These helpers provide generic
+ navigation for plugins; a durable web-only client is a separate future surface
+ contract. See [ADR 0052](../adr/0052-web-buffer-output-and-url-actions.md).
++
++An application may opt into a client-scoped navigation slot:
++
++```python
++from jusi.editor_client import open_url, close_url
++open_url('https://example.com/first', slot='page')
++open_url('https://example.com/second', slot='page')  # delete first, create second
++close_url(slot='page')  # also closes hidden pages; repeated close is harmless
++```
++
++Slots accept 1-64 ASCII letters, digits, underscores or hyphens and never target
++another client's page. A slot open replaces its prior buffer, rather than
++navigating it in place. Managed pages use the source application's window,
++retaining the terminal buffer underneath. Placement searches all tabs; if both
++the terminal and page are hidden, core reveals the source terminal in a new
++window before opening its replacement. Replacement always deletes the old
++buffer, wherever it is displayed or hidden. `close_url` restores that terminal
++in windows still displaying the page; a window reused for unrelated content
++is left alone. Native window close hides the page; use `JusiToggleFocus` from
++the source cell to reveal the retained terminal again.
++Closing a page leaves the terminal application alive.
++Closing the source client leaves its last delivered page available and forgets
++the slot. Helpers block for editor acknowledgment; serialize navigation calls
++and keep them off the application UI thread. Worker editor-action results can
++use the equivalent `jusi.plugin_api` helpers. See
++[ADR 0053](../adr/0053-client-scoped-url-slots.md).
+diff --git a/docs/1.0/incidents/0031-hidden-managed-url-replacement.md b/docs/1.0/incidents/0031-hidden-managed-url-replacement.md
+new file mode 100644
+index 0000000..dfa3901
+--- /dev/null
++++ b/docs/1.0/incidents/0031-hidden-managed-url-replacement.md
+@@ -0,0 +1,25 @@
++# Incident 0031: Hidden managed URL pages blocked replacement
++
++- Date: 2026-10-27
++
++Opening a row in jusi-web failed with `frontend_delivery_failed` when both its
++terminal and its previous managed page were hidden. Destination capture rejected
++the action before fetching its slot, leaving the old page alive. Separately,
++`surface:close()` marked itself closed before buffer deletion; a deletion error
++could make subsequent replacement forget a still-live page. Worker-returned
++managed opens also used the current window without preserving the source
++terminal, unlike application opens.
++
++Managed URL delivery now captures the verified source identity even while
++hidden and resolves placement across all tabs after fetching the content. A
++hidden source is revealed in a new window without overwriting unrelated
++buffers. Application and worker-result opens use the same source-aware path.
++Page close becomes final only after successful cleanup, preserving retryability.
++Unkeyed snapshots keep their original captured-window validation.
++
++The external jusi-web real service/kernel/VisiData/Neovim regression reproduces
++the old rejection and checks hidden drilldown, bookmark replacement in another
++tab, hidden direct URL followup, worker-returned URL replacement, deletion of
++every previous page, and isolation of another cell's page. Frontend tests also
++cover a page mirrored across tabs and injected buffer-deletion failure followed
++by successful replacement. Browser rendering uses a substitute host command.
+diff --git a/docs/1.0/status.md b/docs/1.0/status.md
+index 8f90181..e2bd79e 100644
+--- a/docs/1.0/status.md
++++ b/docs/1.0/status.md
+@@ -1,9 +1,11 @@
+ # Jusi 1.0 Status
+ 
+-Updated: 2026-10-20
++Updated: 2026-10-27
+ 
+ ## Current Facts
+ 
++- Generic URL actions support client-scoped navigation slots across all tabs, including opens with both terminal and page hidden. Application and worker-result opens share source placement; failed deletion preserves retryable slot ownership. Terminal clients, repurposed windows and other clients' pages remain isolated. See [ADR 0053](adr/0053-client-scoped-url-slots.md) and [Incident 0031](incidents/0031-hidden-managed-url-replacement.md).
++
+ - Optional `JusiWebBuffer` presentation now supports bounded Jupyter HTML/SVG/image/JavaScript MIME bundles with plain-text fallback, cell-owned cleanup, and generic HTTP(S) `open_url` editor actions. Rich output reuses the cell’s visible output window, and the statusline composes with host browser indicators; see [Incident 0030](incidents/0030-web-output-splits-and-statusline.md). Durable web-only clients and reverse proxying remain deferred. See [ADR 0052](adr/0052-web-buffer-output-and-url-actions.md) and [usage](architecture/web-presentation.md).
+ 
+ - Plugins can opt into explicit client initialization through `:JusiBootstrap` or empty-cell execution. Drafts and history are preserved; matching clients are reused and changed headers conflict. ACP opts in without sending an agent prompt. Shell opts in without sending a command; PostgreSQL and ClickHouse use the shared SQL bootstrap payload to warm metadata without a dummy query. See [ADR 0051](adr/0051-explicit-plugin-bootstrap.md). Dedicated ACP bootstrap validation passes; broader ACP session-features validation hits the native Neovim crash recorded in [Incident 0029](incidents/0029-acp-session-features-native-neovim-crash.md).
+diff --git a/lua/jusi/editor_actions.lua b/lua/jusi/editor_actions.lua
+index 028fc4e..9a74a75 100644
+--- a/lua/jusi/editor_actions.lua
++++ b/lua/jusi/editor_actions.lua
+@@ -66,9 +66,24 @@ function M.apply(result, opts)
+   opts = opts or {}
+   local valid, err = protocol.validate_editor_action(result, result and result.action)
+   if not valid then return nil, err end
+-  if result.action == "open_url" then
+-    local ok, surface = pcall(require("jusi.presentation.web").open, result.url, { win = opts.win, enter = true })
++  if result.action == "open_url" or result.action == "close_url" then
++    local slots = opts.url_slots
++    if result.slot then
++      if not slots then return nil, "managed URLs require an owning client" end
++      local previous = slots[result.slot]
++      if previous then
++        local ok, failure = pcall(previous.close, previous)
++        if not ok then return nil, tostring(failure) end
++        slots[result.slot] = nil
++      end
++    end
++    if result.action == "close_url" then return true end
++    local ok, surface = pcall(require("jusi.presentation.web").open, result.url, {
++      win = opts.win or (result.slot and vim.api.nvim_get_current_win() or nil), enter = true,
++      replace = result.slot ~= nil, source_buf = opts.source_buf,
++    })
+     if not ok then return nil, tostring(surface) end
++    if result.slot then slots[result.slot] = surface end
+     return surface.buf
+   end
+   if result.action == "show_diff" then return show_diff(result, opts) end
+diff --git a/lua/jusi/init.lua b/lua/jusi/init.lua
+index 6101954..0db967d 100644
+--- a/lua/jusi/init.lua
++++ b/lua/jusi/init.lua
+@@ -128,6 +128,10 @@ local function bind_cell_lifecycle(session)
+   controller.on_state_changed = require("jusi.statusline").redraw
+   local presentation, interactive = session.presentation, session.interactive
+   interactive.editor_id = controller.editor_id
++  -- Slots are scoped to this notebook session and the verified source client.
++  -- They are navigation exports, never backend surfaces or buffer identities.
++  local url_slots = {}
++  session.url_slots = url_slots
+   local function capture_destination(action)
+     if action.action ~= "open" and action.action ~= "open_url" then return nil end
+     local current = vim.api.nvim_get_current_win()
+@@ -136,21 +140,53 @@ local function bind_cell_lifecycle(session)
+       if record.client.client_id == action.client_id and record.buf and vim.api.nvim_buf_is_valid(record.buf) then
+         local win = vim.api.nvim_win_get_buf(current) == record.buf and current or windows.find(record.buf)
+         if win then return { win = win, buf = record.buf, surface_id = surface_id } end
++        -- A managed page can occupy the terminal's window. It remains a
++        -- verified destination for that client while its terminal is hidden.
++        for _, page in pairs(url_slots[action.client_id] or {}) do
++          if not page.closed and vim.api.nvim_buf_is_valid(page.buf) then
++            win = vim.api.nvim_win_get_buf(current) == page.buf and current or windows.find(page.buf)
++            if win then return { win = win, buf = record.buf, displayed_buf = page.buf, surface_id = surface_id } end
++          end
++        end
++        -- Managed URL content may arrive while every projection is hidden.
++        -- Keep the verified source identity; decide placement after fetching
++        -- the content (only then do we know whether this is a managed open).
++        if action.action == "open_url" then return { buf = record.buf, surface_id = surface_id } end
+       end
+     end
+     return false -- A notebook window is not the source of an application open.
+   end
+-  local delivery = require("jusi.editor_delivery").new(controller, function(content, action, source_path, destination)
++  local function apply_editor_action(content, action, source_path, destination)
+     local win
+     if content.action == "open" or content.action == "open_url" then
+       if not destination then return nil end
+       local record = interactive.surfaces[destination.surface_id]
+       win = destination.win
+-      if not record or record.client.client_id ~= action.client_id or record.buf ~= destination.buf
+-          or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= destination.buf then return nil end
++      if not record or record.closed or record.client.client_id ~= action.client_id
++          or record.buf ~= destination.buf or not vim.api.nvim_buf_is_valid(record.buf) then return nil end
++      if content.action == "open_url" and content.slot then
++        local windows = require("jusi.presentation.window")
++        -- Placement is independent of replacement ownership. Find the live
++        -- source/page across all tabs, including moves during content fetch.
++        win = windows.find(record.buf)
++        local page = (url_slots[action.client_id] or {})[content.slot]
++        if not win and page and not page.closed and vim.api.nvim_buf_is_valid(page.buf) then
++          win = windows.find(page.buf)
++        end
++        if not win then
++          win = windows.show(record.buf, { anchor_buf = model.buf, height = interactive.height })
++        end
++      elseif not win or not vim.api.nvim_win_is_valid(win)
++          or vim.api.nvim_win_get_buf(win) ~= (destination.displayed_buf or destination.buf) then return nil end
+     end
+-    return require("jusi.editor_actions").apply(content, { win = win, source_path = source_path })
+-  end, capture_destination)
++    url_slots[action.client_id] = url_slots[action.client_id] or {}
++    return require("jusi.editor_actions").apply(content, { win = win, source_buf = destination and destination.buf,
++      source_path = source_path,
++      url_slots = url_slots[action.client_id] })
++  end
++  session.apply_editor_action = apply_editor_action
++  session.capture_editor_destination = capture_destination
++  local delivery = require("jusi.editor_delivery").new(controller, apply_editor_action, capture_destination)
+   controller.on_editor_action = function(action) delivery:request(action) end
+   session.editor_delivery = delivery
+   session.attention = require("jusi.attention").attach(session)
+@@ -185,6 +221,10 @@ local function bind_cell_lifecycle(session)
+       end
+     end
+   end
++  controller.on_client_closed = function(client, payload)
++    -- Delivered pages survive source close. Forget only replacement authority.
++    url_slots[payload.client_id or (client and client.client_id)] = nil
++  end
+   controller.on_client_created = function(client)
+     if client.notebook_id == model.notebook_id then
+       if presentation.retired_executions[client.execution_id] then lifecycle:close_client(client.client_id)
+@@ -202,6 +242,9 @@ local function bind_cell_lifecycle(session)
+     interactive:close_surface(payload.surface_id or (surface and surface.surface_id))
+   end
+   controller.on_resynchronized = function(snapshot)
++    for client_id in pairs(url_slots) do
++      if not controller.clients[client_id] then url_slots[client_id] = nil end
++    end
+     marks:resync(snapshot)
+     if snapshot.reason == "supervisor_replaced" then editing.overrides = {}; editing.submissions = {}; editing.history.pending = {} end
+     editing:catalog(); editing.cache = {}; editing:schedule()
+@@ -578,7 +621,17 @@ function M.editor_action(action, opts)
+   return session.controller:editor_action(cell.id, action, opts.selection, function(response, failure)
+     if failure then notify(failure_text(failure), vim.log.levels.ERROR); return end
+     if not response then return end
+-    local delivered, err = require("jusi.editor_actions").apply(response.editor_action, { register = opts.register, win = win })
++    local client_id = response.client.client_id
++    session.url_slots[client_id] = session.url_slots[client_id] or {}
++    local delivered, err
++    if response.editor_action.action == "open_url" and response.editor_action.slot then
++      local source = { action = "open_url", client_id = client_id }
++      delivered, err = session.apply_editor_action(response.editor_action, source, nil,
++        session.capture_editor_destination(source))
++    else
++      delivered, err = require("jusi.editor_actions").apply(response.editor_action,
++        { register = opts.register, win = win, url_slots = session.url_slots[client_id] })
++    end
+     if not delivered then notify(err, vim.log.levels.ERROR) end
+   end)
+ end
+diff --git a/lua/jusi/presentation/web.lua b/lua/jusi/presentation/web.lua
+index a9f2168..144497e 100644
+--- a/lua/jusi/presentation/web.lua
++++ b/lua/jusi/presentation/web.lua
+@@ -16,6 +16,11 @@ function M.open(url, opts)
+   local tab = win and vim.api.nvim_win_get_tabpage(win) or vim.api.nvim_get_current_tabpage()
+   local reuse = opts.reuse_buf and windows.find(opts.reuse_buf, tab)
+   local previous = reuse and opts.reuse_buf
++  if opts.replace then
++    assert(win, 'replacing a web view requires a source window')
++    previous = vim.api.nvim_win_get_buf(win)
++    reuse = win
++  end
+   local scratch
+   if reuse then
+     win = reuse
+@@ -55,13 +60,27 @@ function M.open(url, opts)
+   if opts.enter then vim.api.nvim_set_current_win(win)
+   elseif vim.api.nvim_win_is_valid(original) then vim.api.nvim_set_current_win(original) end
+   local surface = { buf = buf, execution_id = opts.execution_id }
++  local source_buf = opts.source_buf or previous
++  local function restore_source()
++    if not opts.replace or not vim.api.nvim_buf_is_valid(source_buf) then return end
++    -- Only restore windows still showing this page. A user may have reused
++    -- its former window for an unrelated buffer while the page was hidden.
++    for _, window in ipairs(vim.fn.win_findbuf(buf)) do
++      if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == buf then
++        vim.api.nvim_win_set_buf(window, source_buf)
++        require('jusi.statusline').refresh(window)
++      end
++    end
++  end
+   function surface:close()
+     if self.closed then return end
+-    self.closed = true
+     if vim.api.nvim_buf_is_valid(self.buf) then
++      restore_source()
+       windows.close_for_buffer(self.buf)
+       vim.api.nvim_buf_delete(self.buf, { force = true })
+     end
++    -- A failed restore/delete must remain retryable in its owning slot.
++    self.closed = true
+   end
+   return surface
+ end
+diff --git a/lua/jusi/protocol.lua b/lua/jusi/protocol.lua
+index 12881ef..2051f56 100644
+--- a/lua/jusi/protocol.lua
++++ b/lua/jusi/protocol.lua
+@@ -345,7 +345,7 @@ function M.validate_command(command, expected_kind)
+   end
+   if expected_kind == "editor_action" then
+     allowed.selection = true
+-    if not set({ "copy", "open", "show_diff", "open_url" })[command.action] or type(command.selection) ~= "table"
++    if not set({ "copy", "open", "show_diff", "open_url", "close_url" })[command.action] or type(command.selection) ~= "table"
+         or (#command.selection > 0) then return false, "invalid editor action selection" end
+   end
+   if expected_kind == "ack_editor_action" and command.outcome ~= "delivered" and command.outcome ~= "failed" then
+@@ -784,15 +784,22 @@ function M.validate_completion(result, cursor_pos)
+ end
+ 
+ function M.validate_editor_action(result, action)
+-  if type(result) ~= "table" or result.action ~= action or not set({ "copy", "open", "show_diff", "open_url" })[action] then
++  if type(result) ~= "table" or result.action ~= action or not set({ "copy", "open", "show_diff", "open_url", "close_url" })[action] then
+     return false, "editor action does not match request"
+   end
+   local fields = action == "copy" and { "action", "text", "regtype" } or { "action", "text", "name", "filetype" }
+-  if action == "open_url" then fields = { "action", "text", "url" } end
++  if action == "open_url" then
++    fields = { "action", "text", "url" }
++    if result.slot ~= nil then table.insert(fields, "slot") end
++  end
++  if action == "close_url" then fields = { "action", "text", "slot" } end
+   if action == "show_diff" then fields = { "action", "text", "before_bytes", "before_name", "after_name", "filetype" } end
+   local ok, err = exact_fields(result, fields)
+   if not ok then return false, err end
+   if type(result.text) ~= "string" or result.text:find("%z") then return false, "invalid editor text" end
++  if result.slot ~= nil and (type(result.slot) ~= "string" or #result.slot < 1 or #result.slot > 64
++      or not result.slot:match("^[A-Za-z0-9_-]+$")) then return false, "invalid URL slot" end
++  if action == "close_url" then return result.text == "", "URL close text must be empty" end
+   if action == "open_url" then
+     return result.text == "" and type(result.url) == "string" and vim.fn.strchars(result.url) <= 8192
+       and result.url:match("^https?://.+$") ~= nil and not result.url:find("[%s%c]"), "invalid HTTP(S) URL"
+@@ -821,7 +828,7 @@ function M.validate_editor_action_metadata(value)
+   local ok, err = exact_fields(value, fields)
+   if not ok then return false, err end
+   for _, key in ipairs(fields) do if not bounded_string(value[key], 1, 128) then return false, "invalid editor action identity" end end
+-  if value.action ~= "copy" and value.action ~= "open" and value.action ~= "show_diff" and value.action ~= "open_url" then return false, "invalid editor action type" end
++  if value.action ~= "copy" and value.action ~= "open" and value.action ~= "show_diff" and value.action ~= "open_url" and value.action ~= "close_url" then return false, "invalid editor action type" end
+   return true
+ end
+ 
+diff --git a/protocol/fixtures/v1/invalid/close-url-missing-slot.json b/protocol/fixtures/v1/invalid/close-url-missing-slot.json
+new file mode 100644
+index 0000000..8e602b2
+--- /dev/null
++++ b/protocol/fixtures/v1/invalid/close-url-missing-slot.json
+@@ -0,0 +1,4 @@
++{
++  "action": "close_url",
++  "text": ""
++}
+diff --git a/protocol/fixtures/v1/invalid/close-url-text.json b/protocol/fixtures/v1/invalid/close-url-text.json
+new file mode 100644
+index 0000000..ae8559a
+--- /dev/null
++++ b/protocol/fixtures/v1/invalid/close-url-text.json
+@@ -0,0 +1,5 @@
++{
++  "action": "close_url",
++  "text": "not empty",
++  "slot": "page"
++}
+diff --git a/protocol/fixtures/v1/invalid/close-url-url.json b/protocol/fixtures/v1/invalid/close-url-url.json
+new file mode 100644
+index 0000000..72c6cf7
+--- /dev/null
++++ b/protocol/fixtures/v1/invalid/close-url-url.json
+@@ -0,0 +1,6 @@
++{
++  "action": "close_url",
++  "text": "",
++  "slot": "page",
++  "url": "https://example.com"
++}
+diff --git a/protocol/fixtures/v1/invalid/open-url-slot.json b/protocol/fixtures/v1/invalid/open-url-slot.json
+new file mode 100644
+index 0000000..83d23ae
+--- /dev/null
++++ b/protocol/fixtures/v1/invalid/open-url-slot.json
+@@ -0,0 +1,6 @@
++{
++  "action": "open_url",
++  "text": "",
++  "url": "https://example.com",
++  "slot": "../another-client"
++}
+diff --git a/protocol/fixtures/v1/scenarios/web-presentation.json b/protocol/fixtures/v1/scenarios/web-presentation.json
+index 0ffd9c9..47e7291 100644
+--- a/protocol/fixtures/v1/scenarios/web-presentation.json
++++ b/protocol/fixtures/v1/scenarios/web-presentation.json
+@@ -31,5 +31,24 @@
+     }
+   ],
+   "expected_fallback": "Figure",
+-  "expected_web_media": "image/svg+xml"
++  "expected_web_media": "image/svg+xml",
++  "managed_actions": [
++    {
++      "action": "open_url",
++      "text": "",
++      "url": "https://example.com/one",
++      "slot": "page"
++    },
++    {
++      "action": "open_url",
++      "text": "",
++      "url": "https://example.com/two",
++      "slot": "page"
++    },
++    {
++      "action": "close_url",
++      "text": "",
++      "slot": "page"
++    }
++  ]
+ }
+diff --git a/protocol/fixtures/v1/valid/close-url.json b/protocol/fixtures/v1/valid/close-url.json
+new file mode 100644
+index 0000000..c6be82e
+--- /dev/null
++++ b/protocol/fixtures/v1/valid/close-url.json
+@@ -0,0 +1,5 @@
++{
++  "action": "close_url",
++  "text": "",
++  "slot": "page"
++}
+diff --git a/protocol/fixtures/v1/valid/open-url-slot.json b/protocol/fixtures/v1/valid/open-url-slot.json
+new file mode 100644
+index 0000000..4ba2a54
+--- /dev/null
++++ b/protocol/fixtures/v1/valid/open-url-slot.json
+@@ -0,0 +1,6 @@
++{
++  "action": "open_url",
++  "text": "",
++  "url": "https://example.com/next",
++  "slot": "page"
++}
+diff --git a/protocol/schema/v1/commands.schema.json b/protocol/schema/v1/commands.schema.json
+index 4f4555f..c6da831 100644
+--- a/protocol/schema/v1/commands.schema.json
++++ b/protocol/schema/v1/commands.schema.json
+@@ -262,7 +262,8 @@
+             "copy",
+             "open",
+             "show_diff",
+-            "open_url"
++            "open_url",
++            "close_url"
+           ]
+         },
+         "selection": {
+diff --git a/protocol/schema/v1/editor-actions.schema.json b/protocol/schema/v1/editor-actions.schema.json
+index 59397dd..4c4319d 100644
+--- a/protocol/schema/v1/editor-actions.schema.json
++++ b/protocol/schema/v1/editor-actions.schema.json
+@@ -56,7 +56,8 @@
+             "copy",
+             "open",
+             "show_diff",
+-            "open_url"
++            "open_url",
++            "close_url"
+           ]
+         }
+       },
+@@ -260,6 +261,10 @@
+         {
+           "if": {"properties": {"action": {"properties": {"action": {"const": "open_url"}}}}},
+           "then": {"properties": {"content": {"properties": {"action": {"const": "open_url"}}}}}
++        },
++        {
++          "if": {"properties": {"action": {"properties": {"action": {"const": "close_url"}}}}},
++          "then": {"properties": {"content": {"properties": {"action": {"const": "close_url"}}}}}
+         }
+       ],
+       "dependentRequired": {
+diff --git a/protocol/schema/v1/responses.schema.json b/protocol/schema/v1/responses.schema.json
+index 9367f6f..93fead2 100644
+--- a/protocol/schema/v1/responses.schema.json
++++ b/protocol/schema/v1/responses.schema.json
+@@ -23,6 +23,35 @@
+       "type": "string",
+       "maxLength": 8192,
+       "pattern": "^https?://[^\\s\\u0000-\\u0020\\u007f]+$"
++    },
++    "slot": {
++      "type": "string",
++      "minLength": 1,
++      "maxLength": 64,
++      "pattern": "^[A-Za-z0-9_-]+$"
++    }
++  },
++  "additionalProperties": false
++},
++{
++  "type": "object",
++  "required": [
++    "action",
++    "text",
++    "slot"
++  ],
++  "properties": {
++    "action": {
++      "const": "close_url"
++    },
++    "text": {
++      "const": ""
++    },
++    "slot": {
++      "type": "string",
++      "minLength": 1,
++      "maxLength": 64,
++      "pattern": "^[A-Za-z0-9_-]+$"
+     }
+   },
+   "additionalProperties": false
+diff --git a/src/jusi/editor_client.py b/src/jusi/editor_client.py
+index 62a8778..cdc5dfb 100644
+--- a/src/jusi/editor_client.py
++++ b/src/jusi/editor_client.py
+@@ -59,9 +59,17 @@ def copy(text: str, *, linewise: bool = False) -> dict[str, str]:
+     return deliver({"action": "copy", "text": text, "regtype": "V" if linewise else "v"})
+ 
+ 
+-def open_url(url: str) -> dict[str, str]:
+-    """Open a browser-reachable HTTP(S) URL in the owning editor."""
+-    return deliver({"action": "open_url", "text": "", "url": url})
++def open_url(url: str, *, slot: str | None = None) -> dict[str, str]:
++    """Open an HTTP(S) URL; a slot replaces only this client's previous page."""
++    content = {"action": "open_url", "text": "", "url": url}
++    if slot is not None:
++        content["slot"] = slot
++    return deliver(content)
++
++
++def close_url(*, slot: str) -> dict[str, str]:
++    """Close this client's named URL slot, including a hidden page; absent is OK."""
++    return deliver({"action": "close_url", "text": "", "slot": slot})
+ 
+ 
+ def open_text(text: str, *, name: str = "selection.txt", filetype: str = "") -> dict[str, str]:
+diff --git a/src/jusi/plugin_api.py b/src/jusi/plugin_api.py
+index 5ce900a..fc4f044 100644
+--- a/src/jusi/plugin_api.py
++++ b/src/jusi/plugin_api.py
+@@ -93,9 +93,17 @@ def copy_text(text: str, *, linewise: bool = False) -> WorkerResult:
+     return _editor_result({"action": "copy", "text": text, "regtype": "V" if linewise else "v"}, "copy")
+ 
+ 
+-def open_url(url: str) -> WorkerResult:
+-    """Open a browser-reachable HTTP(S) URL in the owning editor."""
+-    return _editor_result({"action": "open_url", "text": "", "url": url}, "open_url")
++def open_url(url: str, *, slot: str | None = None) -> WorkerResult:
++    """Open an HTTP(S) URL; a slot replaces only this client's previous page."""
++    content = {"action": "open_url", "text": "", "url": url}
++    if slot is not None:
++        content["slot"] = slot
++    return _editor_result(content, "open_url")
++
++
++def close_url(*, slot: str) -> WorkerResult:
++    """Close this client's named URL slot, including a hidden page; absent is OK."""
++    return _editor_result({"action": "close_url", "text": "", "slot": slot}, "close_url")
+ 
+ 
+ def open_text(text: str, *, name: str = "export.txt", filetype: str = "") -> WorkerResult:
+diff --git a/src/jusi/protocol.py b/src/jusi/protocol.py
+index 87bf611..1637a5d 100644
+--- a/src/jusi/protocol.py
++++ b/src/jusi/protocol.py
+@@ -396,8 +396,8 @@ def validate_command(data: object, expected_kind: str) -> dict[str, Any]:
+         raise ProtocolValidationError("Invalid attention revision")
+     if expected_kind == "editor_action":
+         allowed.add("selection")
+-        if data["action"] not in {"copy", "open", "show_diff", "open_url"} or not isinstance(data.get("selection"), dict):
+-            raise ProtocolValidationError("editor_action requires copy/open/show_diff/open_url and an object selection")
++        if data["action"] not in {"copy", "open", "show_diff", "open_url", "close_url"} or not isinstance(data.get("selection"), dict):
++            raise ProtocolValidationError("editor_action requires copy/open/show_diff/open_url/close_url and an object selection")
+     if expected_kind == "ack_editor_action" and data["outcome"] not in {"delivered", "failed"}:
+         raise ProtocolValidationError("Editor acknowledgment outcome is invalid")
+     unknown = sorted(set(data) - allowed)
+@@ -813,11 +813,13 @@ def validate_completion(result: object, cursor_pos: int) -> dict[str, Any]:
+ 
+ def validate_editor_action(result: object, action: str) -> dict[str, Any]:
+     """Content is transferred, never a target-side filesystem path or command."""
+-    if not isinstance(result, dict) or result.get("action") != action or action not in {"copy", "open", "show_diff", "open_url"}:
++    if not isinstance(result, dict) or result.get("action") != action or action not in {"copy", "open", "show_diff", "open_url", "close_url"}:
+         raise ProtocolValidationError("Editor action does not match the requested action")
+     fields = {"action", "text", "regtype"} if action == "copy" else {"action", "text", "name", "filetype"}
+     if action == "open_url":
+-        fields = {"action", "text", "url"}
++        fields = {"action", "text", "url"} | ({"slot"} if "slot" in result else set())
++    if action == "close_url":
++        fields = {"action", "text", "slot"}
+     if action == "show_diff":
+         fields = {"action", "text", "before_bytes", "before_name", "after_name", "filetype"}
+     if set(result) != fields:
+@@ -825,6 +827,14 @@ def validate_editor_action(result: object, action: str) -> dict[str, Any]:
+     text = result["text"]
+     if not isinstance(text, str) or "\x00" in text:
+         raise ProtocolValidationError("Editor text must be UTF-8 without NUL")
++    if "slot" in result:
++        slot = result["slot"]
++        if not isinstance(slot, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", slot) is None:
++            raise ProtocolValidationError("URL slot must be 1-64 ASCII letters, digits, underscores or hyphens")
++    if action == "close_url":
++        if text != "":
++            raise ProtocolValidationError("URL close text must be empty")
++        return result
+     if action == "open_url":
+         url = result["url"]
+         if text != "" or not isinstance(url, str) or len(url) > 8192 or re.fullmatch(r"https?://[^\s\x00-\x20\x7f]+", url) is None:
+@@ -849,7 +859,7 @@ def validate_editor_action(result: object, action: str) -> dict[str, Any]:
+ 
+ def validate_editor_action_metadata(value: object) -> dict[str, str]:
+     fields = {"action_id", "client_id", "runtime_id", "notebook_id", "cell_id", "editor_id", "trace_id", "action"}
+-    if not isinstance(value, dict) or set(value) != fields or value["action"] not in {"copy", "open", "show_diff", "open_url"}:
++    if not isinstance(value, dict) or set(value) != fields or value["action"] not in {"copy", "open", "show_diff", "open_url", "close_url"}:
+         raise ProtocolValidationError("Invalid editor action metadata")
+     for key in fields:
+         if not _bounded_string(value[key], 1, 128):
+diff --git a/tests/backend/integration/test_editor_action_socket.py b/tests/backend/integration/test_editor_action_socket.py
+index bc6d2e5..919be2b 100644
+--- a/tests/backend/integration/test_editor_action_socket.py
++++ b/tests/backend/integration/test_editor_action_socket.py
+@@ -180,3 +180,34 @@ def test_open_url_helper_preserves_url_through_private_delivery(monkeypatch):
+     finally:
+         manager.close()
+         broker.close()
++
++
++def test_managed_url_helpers_preserve_slots_and_acknowledge_close(monkeypatch):
++    from concurrent.futures import ThreadPoolExecutor
++    from jusi.editor_client import open_url, close_url
++    from jusi.plugin_api import open_url as worker_open, close_url as worker_close
++    notices = Queue()
++    manager = EditorActionManager(notices.put, timeout=3)
++    manager.register(SimpleNamespace(capabilities=("editor_actions",), client_id="cli_slot", runtime_id="run_slot", notebook_id="nb_slot", cell_id="cell_slot"))
++    manager.connect("editor_slot", "connection_slot")
++    manager.bind("cli_slot", "editor_slot")
++    broker = LocalEditorActionBroker()
++    env = broker.open("cli_slot", lambda content: manager.submit("cli_slot", content))
++    monkeypatch.setenv("JUSI_EDITOR_ACTION_SOCKET", env["JUSI_EDITOR_ACTION_SOCKET"])
++    try:
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            for helper, args, expected in [
++                (open_url, ("https://example.com/page",), worker_open("https://example.com/page", slot="page").result),
++                (close_url, (), worker_close(slot="page").result),
++            ]:
++                future = pool.submit(helper, *args, slot="page")
++                action = notices.get(timeout=3)
++                assert "slot" not in action and "url" not in action
++                fetched = manager.fetch(action["action_id"], "editor_slot", 0)
++                assert fetched["content"] == expected
++                assert not future.done()
++                manager.acknowledge(action["action_id"], "editor_slot", "delivered")
++                assert future.result(timeout=3)["outcome"] == "delivered"
++    finally:
++        manager.close()
++        broker.close()
+diff --git a/tests/conformance/test_web_presentation.py b/tests/conformance/test_web_presentation.py
+index d424027..7684561 100644
+--- a/tests/conformance/test_web_presentation.py
++++ b/tests/conformance/test_web_presentation.py
+@@ -14,6 +14,9 @@ def read(name):
+ @pytest.mark.parametrize('name,validate,schema,bad', [
+     ('open-url', lambda v: validate_editor_action(v, 'open_url'), 'responses.schema.json#/$defs/editor_action',
+      ['open-url-scheme', 'open-url-newline', 'open-url-empty-host']),
++    ('open-url-slot', lambda v: validate_editor_action(v, 'open_url'), 'responses.schema.json#/$defs/editor_action', ['open-url-slot']),
++    ('close-url', lambda v: validate_editor_action(v, 'close_url'), 'responses.schema.json#/$defs/editor_action',
++     ['close-url-missing-slot', 'close-url-text', 'close-url-url']),
+     ('javascript-bundle', validate_event, 'events.schema.json', []),
+     ('mime-bundle', validate_event, 'events.schema.json', ['mime-bundle-boundary', 'mime-bundle-media']),
+ ])
+diff --git a/tests/frontend/managed_urls_spec.lua b/tests/frontend/managed_urls_spec.lua
+new file mode 100644
+index 0000000..6eeeadf
+--- /dev/null
++++ b/tests/frontend/managed_urls_spec.lua
+@@ -0,0 +1,117 @@
++local M = {}
++local protocol = require('jusi.protocol')
++local actions = require('jusi.editor_actions')
++local function read(name)
++  return vim.json.decode(table.concat(vim.fn.readfile('protocol/fixtures/v1/' .. name .. '.json'), '\n'))
++end
++function M.run()
++  assert(protocol.validate_editor_action(read('valid/open-url-slot'), 'open_url'))
++  assert(protocol.validate_editor_action(read('valid/close-url'), 'close_url'))
++  assert(not protocol.validate_editor_action(read('invalid/open-url-slot'), 'open_url'))
++  for _, name in ipairs({ 'missing-slot', 'text', 'url' }) do
++    assert(not protocol.validate_editor_action(read('invalid/close-url-' .. name), 'close_url'))
++  end
++  local original = vim.api.nvim_get_current_win()
++  local source_buf = vim.api.nvim_get_current_buf()
++  local source_lines = vim.api.nvim_buf_get_lines(source_buf, 0, -1, false)
++  local source = vim.api.nvim_open_win(source_buf, true, { split = 'below', win = original })
++  local other_buf = vim.api.nvim_create_buf(false, true)
++  local other_win = vim.api.nvim_open_win(other_buf, false, { split = 'right', win = original })
++  local opened = {}
++  vim.api.nvim_create_user_command('JusiWebBuffer', function(command)
++    local buf = vim.api.nvim_create_buf(false, true)
++    vim.api.nvim_set_current_buf(buf)
++    table.insert(opened, buf)
++  end, { nargs = '?' })
++  local first, second = {}, {}
++  local function open(slots, url, win, source_buffer)
++    return assert(actions.apply({ action = 'open_url', text = '', url = url, slot = 'page' },
++      { win = win or source, source_buf = source_buffer or source_buf, url_slots = slots }))
++  end
++  local function close(slots)
++    assert(actions.apply({ action = 'close_url', text = '', slot = 'page' }, { url_slots = slots }))
++  end
++  local ok, failure = xpcall(function()
++    local count = #vim.api.nvim_list_wins()
++    local a = open(first, 'https://one.test')
++    assert(vim.api.nvim_win_get_buf(source) == a and #vim.api.nvim_list_wins() == count,
++      'managed page did not reuse its source window')
++    local other = open(second, 'https://other.test', other_win, other_buf)
++    -- Hidden projections still belong to their slot and must be deleted.
++    for _, win in ipairs(vim.fn.win_findbuf(a)) do vim.api.nvim_win_close(win, true) end
++    assert(vim.api.nvim_buf_is_valid(a))
++    source = vim.api.nvim_open_win(source_buf, true, { split = 'below', win = original })
++    local b = open(first, 'https://two.test')
++    assert(not vim.api.nvim_buf_is_valid(a) and b ~= a)
++    assert(vim.api.nvim_buf_is_valid(other), 'another client lost its page')
++    -- Native close cannot end the source terminal/client; a repeated close is OK.
++    vim.api.nvim_buf_delete(b, { force = true })
++    close(first); close(first)
++    assert(vim.api.nvim_buf_is_valid(source_buf))
++    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(source_buf, 0, -1, false), source_lines))
++    assert(vim.api.nvim_buf_is_valid(other))
++    source = vim.api.nvim_open_win(source_buf, true, { split = 'below', win = original })
++    local c = open(first, 'https://three.test')
++    -- Replace directly while the terminal is covered by its managed page.
++    local d = open(first, 'https://four.test')
++    assert(not vim.api.nvim_buf_is_valid(c) and vim.api.nvim_win_get_buf(source) == d)
++    close(first)
++    assert(not vim.api.nvim_buf_is_valid(d) and vim.api.nvim_win_get_buf(source) == source_buf)
++    -- Failed deletion must keep replacement authority so a later open retries.
++    local retry = open(first, 'https://retry.test')
++    local delete = vim.api.nvim_buf_delete
++    vim.api.nvim_buf_delete = function(buf, opts)
++      if buf == retry then error('temporary deletion failure') end
++      return delete(buf, opts)
++    end
++    local delivered = actions.apply({ action = 'close_url', text = '', slot = 'page' }, { url_slots = first })
++    vim.api.nvim_buf_delete = delete
++    assert(not delivered and first.page and not first.page.closed, 'failed close forgot a live page')
++    local retried = open(first, 'https://retried.test')
++    assert(not vim.api.nvim_buf_is_valid(retry), 'replacement did not retry page deletion')
++    close(first)
++    assert(not vim.api.nvim_buf_is_valid(retried))
++    -- A buffer can be displayed in multiple tabs. Retire it everywhere.
++    local mirrored = open(first, 'https://mirrored.test')
++    vim.cmd('tabnew')
++    local mirror = vim.api.nvim_get_current_win()
++    vim.api.nvim_win_set_buf(mirror, mirrored)
++    vim.api.nvim_set_current_win(source)
++    local replacement = open(first, 'https://replacement.test')
++    assert(not vim.api.nvim_buf_is_valid(mirrored), 'another tab retained the old page')
++    assert(vim.api.nvim_win_get_buf(mirror) == source_buf, 'another tab did not restore its source')
++    assert(vim.api.nvim_win_get_buf(source) == replacement)
++    vim.api.nvim_win_close(mirror, true)
++    close(first)
++    -- Closing a hidden page must leave a repurposed window alone.
++    local hidden = open(first, 'https://hidden.test')
++    local unrelated = vim.api.nvim_create_buf(false, true)
++    vim.api.nvim_win_set_buf(source, unrelated)
++    close(first)
++    assert(not vim.api.nvim_buf_is_valid(hidden) and vim.api.nvim_win_get_buf(source) == unrelated)
++    vim.api.nvim_win_set_buf(source, source_buf)
++    vim.api.nvim_buf_delete(unrelated, { force = true })
++    assert(not actions.apply({ action = 'close_url', text = '', slot = 'page' }))
++    local before = #opened
++    assert(not actions.apply({ action = 'open_url', text = '', url = 'https://test', slot = '../bad' },
++      { win = source, url_slots = first }))
++    assert(#opened == before)
++    vim.api.nvim_create_user_command('JusiWebBuffer', function()
++      vim.api.nvim_set_current_buf(vim.api.nvim_create_buf(false, true))
++      error('host rejected managed URL')
++    end, { nargs = '?', force = true })
++    local buffers, count = #vim.api.nvim_list_bufs(), #vim.api.nvim_list_wins()
++    assert(not actions.apply({ action = 'open_url', text = '', url = 'https://failure.test', slot = 'page' },
++      { win = source, source_buf = source_buf, url_slots = first }))
++    assert(vim.api.nvim_win_get_buf(source) == source_buf and #vim.api.nvim_list_wins() == count,
++      'host failure did not restore the source window')
++    assert(#vim.api.nvim_list_bufs() == buffers and first.page == nil, 'host failure leaked a page')
++  end, debug.traceback)
++  close(first); close(second)
++  if vim.api.nvim_win_is_valid(source) then vim.api.nvim_win_close(source, true) end
++  if vim.api.nvim_win_is_valid(other_win) then vim.api.nvim_win_close(other_win, true) end
++  vim.api.nvim_buf_delete(other_buf, { force = true })
++  vim.api.nvim_del_user_command('JusiWebBuffer')
++  assert(ok, failure)
++end
++return M

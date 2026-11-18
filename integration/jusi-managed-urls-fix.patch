@@ -1,0 +1,207 @@
+diff --git a/docs/1.0/architecture/web-presentation.md b/docs/1.0/architecture/web-presentation.md
+--- a/docs/1.0/architecture/web-presentation.md
++++ b/docs/1.0/architecture/web-presentation.md
+@@ -79,7 +79,10 @@
+ Slots accept 1-64 ASCII letters, digits, underscores or hyphens and never target
+ another client's page. A slot open replaces its prior buffer, rather than
+ navigating it in place. Managed pages use the source application's window,
+-retaining the terminal buffer underneath. `close_url` restores that terminal
++retaining the terminal buffer underneath. Placement searches all tabs; if both
++the terminal and page are hidden, core reveals the source terminal in a new
++window before opening its replacement. Replacement always deletes the old
++buffer, wherever it is displayed or hidden. `close_url` restores that terminal
+ in windows still displaying the page; a window reused for unrelated content
+ is left alone. Native window close hides the page; use `JusiToggleFocus` from
+ the source cell to reveal the retained terminal again.
+diff --git a/docs/1.0/status.md b/docs/1.0/status.md
+--- a/docs/1.0/status.md
++++ b/docs/1.0/status.md
+@@ -1,10 +1,10 @@
+ # Jusi 1.0 Status
+ 
+-Updated: 2026-10-26
++Updated: 2026-10-27
+ 
+ ## Current Facts
+ 
+-- Generic URL actions now support client-scoped navigation slots: keyed opens replace the terminal's window contents with a new page; `close_url` restores the terminal and also retires hidden pages idempotently. Terminal clients survive page closure, repurposed windows and other clients' pages are isolated, and a visible managed page can anchor its client's next open. See [ADR 0053](adr/0053-client-scoped-url-slots.md).
++- Generic URL actions support client-scoped navigation slots across all tabs, including opens with both terminal and page hidden. Application and worker-result opens share source placement; failed deletion preserves retryable slot ownership. Terminal clients, repurposed windows and other clients' pages remain isolated. See [ADR 0053](adr/0053-client-scoped-url-slots.md) and [Incident 0031](incidents/0031-hidden-managed-url-replacement.md).
+ 
+ - Optional `JusiWebBuffer` presentation now supports bounded Jupyter HTML/SVG/image/JavaScript MIME bundles with plain-text fallback, cell-owned cleanup, and generic HTTP(S) `open_url` editor actions. Rich output reuses the cell’s visible output window, and the statusline composes with host browser indicators; see [Incident 0030](incidents/0030-web-output-splits-and-statusline.md). Durable web-only clients and reverse proxying remain deferred. See [ADR 0052](adr/0052-web-buffer-output-and-url-actions.md) and [usage](architecture/web-presentation.md).
+ 
+diff --git a/lua/jusi/init.lua b/lua/jusi/init.lua
+--- a/lua/jusi/init.lua
++++ b/lua/jusi/init.lua
+@@ -148,25 +148,45 @@
+             if win then return { win = win, buf = record.buf, displayed_buf = page.buf, surface_id = surface_id } end
+           end
+         end
++        -- Managed URL content may arrive while every projection is hidden.
++        -- Keep the verified source identity; decide placement after fetching
++        -- the content (only then do we know whether this is a managed open).
++        if action.action == "open_url" then return { buf = record.buf, surface_id = surface_id } end
+       end
+     end
+     return false -- A notebook window is not the source of an application open.
+   end
+-  local delivery = require("jusi.editor_delivery").new(controller, function(content, action, source_path, destination)
++  local function apply_editor_action(content, action, source_path, destination)
+     local win
+     if content.action == "open" or content.action == "open_url" then
+       if not destination then return nil end
+       local record = interactive.surfaces[destination.surface_id]
+       win = destination.win
+-      if not record or record.client.client_id ~= action.client_id or record.buf ~= destination.buf
+-          or not vim.api.nvim_win_is_valid(win)
++      if not record or record.closed or record.client.client_id ~= action.client_id
++          or record.buf ~= destination.buf or not vim.api.nvim_buf_is_valid(record.buf) then return nil end
++      if content.action == "open_url" and content.slot then
++        local windows = require("jusi.presentation.window")
++        -- Placement is independent of replacement ownership. Find the live
++        -- source/page across all tabs, including moves during content fetch.
++        win = windows.find(record.buf)
++        local page = (url_slots[action.client_id] or {})[content.slot]
++        if not win and page and not page.closed and vim.api.nvim_buf_is_valid(page.buf) then
++          win = windows.find(page.buf)
++        end
++        if not win then
++          win = windows.show(record.buf, { anchor_buf = model.buf, height = interactive.height })
++        end
++      elseif not win or not vim.api.nvim_win_is_valid(win)
+           or vim.api.nvim_win_get_buf(win) ~= (destination.displayed_buf or destination.buf) then return nil end
+     end
+     url_slots[action.client_id] = url_slots[action.client_id] or {}
+     return require("jusi.editor_actions").apply(content, { win = win, source_buf = destination and destination.buf,
+       source_path = source_path,
+       url_slots = url_slots[action.client_id] })
+-  end, capture_destination)
++  end
++  session.apply_editor_action = apply_editor_action
++  session.capture_editor_destination = capture_destination
++  local delivery = require("jusi.editor_delivery").new(controller, apply_editor_action, capture_destination)
+   controller.on_editor_action = function(action) delivery:request(action) end
+   session.editor_delivery = delivery
+   session.attention = require("jusi.attention").attach(session)
+@@ -603,8 +623,15 @@
+     if not response then return end
+     local client_id = response.client.client_id
+     session.url_slots[client_id] = session.url_slots[client_id] or {}
+-    local delivered, err = require("jusi.editor_actions").apply(response.editor_action,
+-      { register = opts.register, win = win, url_slots = session.url_slots[client_id] })
++    local delivered, err
++    if response.editor_action.action == "open_url" and response.editor_action.slot then
++      local source = { action = "open_url", client_id = client_id }
++      delivered, err = session.apply_editor_action(response.editor_action, source, nil,
++        session.capture_editor_destination(source))
++    else
++      delivered, err = require("jusi.editor_actions").apply(response.editor_action,
++        { register = opts.register, win = win, url_slots = session.url_slots[client_id] })
++    end
+     if not delivered then notify(err, vim.log.levels.ERROR) end
+   end)
+ end
+diff --git a/lua/jusi/presentation/web.lua b/lua/jusi/presentation/web.lua
+--- a/lua/jusi/presentation/web.lua
++++ b/lua/jusi/presentation/web.lua
+@@ -74,12 +74,13 @@
+   end
+   function surface:close()
+     if self.closed then return end
+-    self.closed = true
+     if vim.api.nvim_buf_is_valid(self.buf) then
+       restore_source()
+       windows.close_for_buffer(self.buf)
+       vim.api.nvim_buf_delete(self.buf, { force = true })
+     end
++    -- A failed restore/delete must remain retryable in its owning slot.
++    self.closed = true
+   end
+   return surface
+ end
+diff --git a/docs/1.0/adr/0053-client-scoped-url-slots.md b/docs/1.0/adr/0053-client-scoped-url-slots.md
+--- a/docs/1.0/adr/0053-client-scoped-url-slots.md
++++ b/docs/1.0/adr/0053-client-scoped-url-slots.md
+@@ -39,9 +39,14 @@
+ to a process-global name or plugin identity. No frontend buffer numbers, window
+ IDs, commands or backend pathnames enter the protocol. Existing editor-action
+ ownership, retirement fencing, reconnect deduplication and delivery leases
+-apply to both operations. Close does not require a visible source window; open
+-captures and verifies either the source terminal's window or a managed page
+-belonging to that same client before applying.
++apply to both operations. Close does not require a visible source window. Open
++captures the verified source terminal identity, then resolves managed placement
++across all tabs when applying the fetched content. If neither terminal nor page
++is visible, reveal the same source terminal in a new window. Windows reused for
++unrelated content are preserved. Worker-returned managed URL actions use the
++same placement and replacement path as application actions. Unkeyed exports
++retain their captured-window validation. Failed page deletion retains the slot
++and keeps close retryable; it cannot silently abandon a live page.
+ 
+ Closing or hiding a page does not close its source client or terminal. Explicit
+ source-client close forgets slot replacement authority while leaving the last
+diff --git a/tests/frontend/managed_urls_spec.lua b/tests/frontend/managed_urls_spec.lua
+--- a/tests/frontend/managed_urls_spec.lua
++++ b/tests/frontend/managed_urls_spec.lua
+@@ -57,6 +57,32 @@
+     assert(not vim.api.nvim_buf_is_valid(c) and vim.api.nvim_win_get_buf(source) == d)
+     close(first)
+     assert(not vim.api.nvim_buf_is_valid(d) and vim.api.nvim_win_get_buf(source) == source_buf)
++    -- Failed deletion must keep replacement authority so a later open retries.
++    local retry = open(first, 'https://retry.test')
++    local delete = vim.api.nvim_buf_delete
++    vim.api.nvim_buf_delete = function(buf, opts)
++      if buf == retry then error('temporary deletion failure') end
++      return delete(buf, opts)
++    end
++    local delivered = actions.apply({ action = 'close_url', text = '', slot = 'page' }, { url_slots = first })
++    vim.api.nvim_buf_delete = delete
++    assert(not delivered and first.page and not first.page.closed, 'failed close forgot a live page')
++    local retried = open(first, 'https://retried.test')
++    assert(not vim.api.nvim_buf_is_valid(retry), 'replacement did not retry page deletion')
++    close(first)
++    assert(not vim.api.nvim_buf_is_valid(retried))
++    -- A buffer can be displayed in multiple tabs. Retire it everywhere.
++    local mirrored = open(first, 'https://mirrored.test')
++    vim.cmd('tabnew')
++    local mirror = vim.api.nvim_get_current_win()
++    vim.api.nvim_win_set_buf(mirror, mirrored)
++    vim.api.nvim_set_current_win(source)
++    local replacement = open(first, 'https://replacement.test')
++    assert(not vim.api.nvim_buf_is_valid(mirrored), 'another tab retained the old page')
++    assert(vim.api.nvim_win_get_buf(mirror) == source_buf, 'another tab did not restore its source')
++    assert(vim.api.nvim_win_get_buf(source) == replacement)
++    vim.api.nvim_win_close(mirror, true)
++    close(first)
+     -- Closing a hidden page must leave a repurposed window alone.
+     local hidden = open(first, 'https://hidden.test')
+     local unrelated = vim.api.nvim_create_buf(false, true)
+diff --git a/docs/1.0/incidents/0031-hidden-managed-url-replacement.md b/docs/1.0/incidents/0031-hidden-managed-url-replacement.md
+new file mode 100644
+--- /dev/null
++++ b/docs/1.0/incidents/0031-hidden-managed-url-replacement.md
+@@ -0,0 +1,25 @@
++# Incident 0031: Hidden managed URL pages blocked replacement
++
++- Date: 2026-10-27
++
++Opening a row in jusi-web failed with `frontend_delivery_failed` when both its
++terminal and its previous managed page were hidden. Destination capture rejected
++the action before fetching its slot, leaving the old page alive. Separately,
++`surface:close()` marked itself closed before buffer deletion; a deletion error
++could make subsequent replacement forget a still-live page. Worker-returned
++managed opens also used the current window without preserving the source
++terminal, unlike application opens.
++
++Managed URL delivery now captures the verified source identity even while
++hidden and resolves placement across all tabs after fetching the content. A
++hidden source is revealed in a new window without overwriting unrelated
++buffers. Application and worker-result opens use the same source-aware path.
++Page close becomes final only after successful cleanup, preserving retryability.
++Unkeyed snapshots keep their original captured-window validation.
++
++The external jusi-web real service/kernel/VisiData/Neovim regression reproduces
++the old rejection and checks hidden drilldown, bookmark replacement in another
++tab, hidden direct URL followup, worker-returned URL replacement, deletion of
++every previous page, and isolation of another cell's page. Frontend tests also
++cover a page mirrored across tabs and injected buffer-deletion failure followed
++by successful replacement. Browser rendering uses a substitute host command.
